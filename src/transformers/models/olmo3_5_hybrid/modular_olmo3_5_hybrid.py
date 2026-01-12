@@ -23,7 +23,6 @@ from ... import initialization as init
 from ...cache_utils import Cache
 from ...generation import GenerationMixin
 from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -32,6 +31,7 @@ from ...utils.generic import check_model_inputs
 from ..olmo3.configuration_olmo3 import Olmo3Config
 from ..olmo3.modeling_olmo3 import (
     Olmo3Attention,
+    Olmo3DecoderLayer,
     Olmo3MLP,
     Olmo3Model,
     Olmo3ForCausalLM,
@@ -101,35 +101,6 @@ class Olmo3_5HybridConfig(Olmo3Config):
         dtype=None,
         **kwargs,
     ):
-        # Important: we intentionally do NOT pass `layer_types` to the parent config,
-        # because Olmo3Config may validate that list against its attention-only values.
-        # We set `self.layer_types` ourselves below.
-        super().__init__(
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_hidden_layers=num_hidden_layers,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            hidden_act=hidden_act,
-            max_position_embeddings=max_position_embeddings,
-            initializer_range=initializer_range,
-            use_cache=use_cache,
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            rope_parameters=rope_parameters,
-            attention_bias=attention_bias,
-            attention_dropout=attention_dropout,
-            rms_norm_eps=rms_norm_eps,
-            sliding_window=sliding_window,
-            layer_types=None,
-            dtype=dtype,
-            **kwargs,
-        )
-
-        # ---------- Hybrid layer layout ----------
         if layer_types is None:
             if fla_hybrid_attention_indices is None:
                 # Default: every 4th layer is attention, others are linear
@@ -154,8 +125,35 @@ class Olmo3_5HybridConfig(Olmo3Config):
         if all(t == "linear_attention" for t in layer_types):
             raise ValueError("OLMo3.5 Hybrid expects at least one attention layer (full or sliding).")
 
+        # Important: we intentionally do NOT pass `layer_types` to the parent config,
+        # because Olmo3Config may validate that list against its attention-only values.
+        # We set `self.layer_types` ourselves below.
+        super().__init__(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            hidden_act=hidden_act,
+            max_position_embeddings=max_position_embeddings,
+            initializer_range=initializer_range,
+            use_cache=use_cache,
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            rope_parameters=rope_parameters,
+            attention_bias=attention_bias,
+            attention_dropout=attention_dropout,
+            rms_norm_eps=rms_norm_eps,
+            sliding_window=sliding_window,
+            layer_types=layer_types,
+            dtype=dtype,
+            **kwargs,
+        )
+
         self.layer_types = list(layer_types)
-        # Keep the indices around for convenience / round-tripping
         self.fla_hybrid_attention_indices = [
             i for i, t in enumerate(self.layer_types) if t in {"full_attention", "sliding_attention"}
         ]
@@ -192,6 +190,24 @@ class _RMSNormNoGateWrapper(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
         return self.norm(hidden_states)
+
+
+class Olmo3_5HybridDynamicCache(Qwen3NextDynamicCache):
+    """
+    Cache capable of storing both:
+      - attention KV caches for attention layers
+      - convolution + recurrent state for linear (GatedDeltaNet) layers
+
+    Inherits the implementation from Qwen3Next and widens the notion of
+    "attention layers" to include both full and sliding attention.
+    """
+
+    def __init__(self, config: Olmo3_5HybridConfig):
+        super().__init__(config)
+        # Qwen3NextDynamicCache only considers "full_attention" layers as transformer layers.
+        # Here we treat any non-linear layer type as an attention layer (full or sliding).
+        self.transformer_layers = [i for i, t in enumerate(config.layer_types) if t != "linear_attention"]
+
 
 
 class Olmo3_5HybridGatedDeltaNet(Qwen3NextGatedDeltaNet):
@@ -235,37 +251,15 @@ class Olmo3_5HybridGatedDeltaNet(Qwen3NextGatedDeltaNet):
         return self._recurrent_gated_delta_rule_impl(*args, **kwargs)
 
 
-class Olmo3_5HybridDynamicCache(Qwen3NextDynamicCache):
-    """
-    Cache capable of storing both:
-      - attention KV caches for attention layers
-      - convolution + recurrent state for linear (GatedDeltaNet) layers
 
-    Inherits the implementation from Qwen3Next and widens the notion of
-    "attention layers" to include both full and sliding attention.
-    """
-
-    def __init__(self, config: Olmo3_5HybridConfig):
-        super().__init__(config)
-        # Qwen3NextDynamicCache only considers "full_attention" layers as transformer layers.
-        # Here we treat any non-linear layer type as an attention layer (full or sliding).
-        self.transformer_layers = [i for i, t in enumerate(config.layer_types) if t != "linear_attention"]
-
-
-class Olmo3_5HybridDecoderLayer(GradientCheckpointingLayer):
+class Olmo3_5HybridDecoderLayer(Olmo3DecoderLayer):
     def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-
+        super().__init__(config, layer_idx)
+        
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
             self.linear_attn = Olmo3_5HybridGatedDeltaNet(config, layer_idx=layer_idx)
-        else:
-            self.self_attn = Olmo3Attention(config=config, layer_idx=layer_idx)
-
-        self.mlp = Olmo3MLP(config)
-        self.post_attention_layernorm = Olmo3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Olmo3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            del self.self_attn  # Remove the attention created by parent
 
     def forward(
         self,
@@ -326,7 +320,7 @@ class Olmo3_5HybridModel(Olmo3Model):
     @torch.no_grad()
     def _init_hybrid_weights(self):
         for module in self.modules():
-            if isinstance(module, Qwen3NextGatedDeltaNet):
+            if isinstance(module, Olmo3_5HybridGatedDeltaNet):
                 init.ones_(module.dt_bias)
                 init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
 

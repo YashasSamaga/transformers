@@ -95,6 +95,29 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         dtype=None,
         **kwargs,
     ):
+        if layer_types is None:
+            if fla_hybrid_attention_indices is None:
+                # Default: every 4th layer is attention, others are linear
+                fla_hybrid_attention_indices = [i for i in range(int(num_hidden_layers)) if i % 4 == 3]
+
+            layer_types = ["linear_attention"] * int(num_hidden_layers)
+            for idx in fla_hybrid_attention_indices:
+                if idx < 0 or idx >= int(num_hidden_layers):
+                    raise ValueError(
+                        f"`fla_hybrid_attention_indices` contains an out-of-range layer index {idx} "
+                        f"for num_hidden_layers={num_hidden_layers}."
+                    )
+                layer_types[idx] = "full_attention"
+
+        if len(layer_types) != int(num_hidden_layers):
+            raise ValueError(
+                f"`layer_types` must have length num_hidden_layers={num_hidden_layers}, got {len(layer_types)}."
+            )
+
+        if "linear_attention" not in layer_types:
+            raise ValueError("OLMo3.5 Hybrid expects at least one 'linear_attention' layer.")
+        if all(t == "linear_attention" for t in layer_types):
+            raise ValueError("OLMo3.5 Hybrid expects at least one attention layer (full or sliding).")
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -131,32 +154,6 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-
-        # ---------- Hybrid layer layout ----------
-        if layer_types is None:
-            if fla_hybrid_attention_indices is None:
-                # Default: every 4th layer is attention, others are linear
-                fla_hybrid_attention_indices = [i for i in range(int(num_hidden_layers)) if i % 4 == 3]
-
-            layer_types = ["linear_attention"] * int(num_hidden_layers)
-            for idx in fla_hybrid_attention_indices:
-                if idx < 0 or idx >= int(num_hidden_layers):
-                    raise ValueError(
-                        f"`fla_hybrid_attention_indices` contains an out-of-range layer index {idx} "
-                        f"for num_hidden_layers={num_hidden_layers}."
-                    )
-                layer_types[idx] = "full_attention"
-
-        if len(layer_types) != int(num_hidden_layers):
-            raise ValueError(
-                f"`layer_types` must have length num_hidden_layers={num_hidden_layers}, got {len(layer_types)}."
-            )
-
-        if "linear_attention" not in layer_types:
-            raise ValueError("OLMo3.5 Hybrid expects at least one 'linear_attention' layer.")
-        if all(t == "linear_attention" for t in layer_types):
-            raise ValueError("OLMo3.5 Hybrid expects at least one attention layer (full or sliding).")
-        # Keep the indices around for convenience / round-tripping
         self.fla_hybrid_attention_indices = [
             i for i, t in enumerate(self.layer_types) if t in {"full_attention", "sliding_attention"}
         ]

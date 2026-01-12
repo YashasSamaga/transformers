@@ -653,6 +653,8 @@
         title: OLMo2
       - local: model_doc/olmo3
         title: Olmo3
+      - local: model_doc/olmo3_5hybrid
+        title: Olmo3.5-hybrid
       - local: model_doc/olmoe
         title: OLMoE
       - local: model_doc/opt
