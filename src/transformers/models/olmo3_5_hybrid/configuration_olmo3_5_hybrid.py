@@ -27,19 +27,7 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
     OLMo3.5 Hybrid configuration.
 
     This configuration extends :class:`~transformers.Olmo3Config` with parameters
-    for the Gated DeltaNet (linear attention) layers and with a convenient way to
-    specify which layers use full attention vs. linear attention.
-
-    The hybrid layout can be specified in two equivalent ways:
-    - Provide `layer_types` directly (a list of length `num_hidden_layers` with values
-      in {"linear_attention", "full_attention", "sliding_attention"}).
-    - Provide `fla_hybrid_attention_indices` (indices of layers that use attention).
-      All remaining layers are set to "linear_attention".
-
-    Notes:
-    - By default, if neither `layer_types` nor `fla_hybrid_attention_indices` are
-      provided, the config uses the common 3:1 hybrid pattern: every 4th layer
-      (i % 4 == 3) is "full_attention", and the others are "linear_attention".
+    for the Gated DeltaNet (linear attention) layers.
     """
 
     model_type = "olmo3_5_hybrid"
@@ -61,7 +49,7 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
 
     def __init__(
         self,
-        vocab_size: int | None = 100278,
+        vocab_size: int | None = 100352,
         hidden_size: int | None = 3840,
         intermediate_size: int | None = 11008,
         num_hidden_layers: int | None = 32,
@@ -81,9 +69,8 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         rms_norm_eps: float | None = 1e-06,
         sliding_window: int | None = 4096,
         layer_types: list[str] | None = None,
-        # --- Hybrid layout helpers ---
         fla_hybrid_attention_indices: list[int] | None = None,
-        # --- Linear (Gated DeltaNet) parameters ---
+        # Linear (Gated DeltaNet) parameters
         linear_num_key_heads: int | None = None,
         linear_num_value_heads: int | None = None,
         linear_key_head_dim: int | None = None,
@@ -91,13 +78,10 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         linear_conv_kernel_dim: int = 4,
         linear_use_gate: bool = True,
         linear_allow_neg_eigval: bool = True,
-        # --- Qwen3Next compatibility (needed by its GatedDeltaNet) ---
-        dtype=None,
         **kwargs,
     ):
         if layer_types is None:
             if fla_hybrid_attention_indices is None:
-                # Default: every 4th layer is attention, others are linear
                 fla_hybrid_attention_indices = [i for i in range(int(num_hidden_layers)) if i % 4 == 3]
 
             layer_types = ["linear_attention"] * int(num_hidden_layers)
@@ -158,15 +142,10 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
             i for i, t in enumerate(self.layer_types) if t in {"full_attention", "sliding_attention"}
         ]
 
-        # ---------- Linear (Gated DeltaNet) hyperparams ----------
-        # Defaults mirror the hybrid training script / FLA convention:
-        #   num_heads * head_dim = 0.75 * hidden_size
-        # and value dim is expanded by 2x vs key dim.
         if linear_num_key_heads is None:
             linear_num_key_heads = int(num_attention_heads)
         if linear_num_value_heads is None:
             linear_num_value_heads = int(num_attention_heads)
-
         if linear_key_head_dim is None:
             linear_key_head_dim = int(0.75 * int(hidden_size) / int(linear_num_key_heads))
         if linear_value_head_dim is None:
