@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 from ... import initialization as init
 from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
+from ...cache_utils import Cache
 from ...generation import GenerationMixin
 from ...integrations import use_kernel_forward_from_hub, use_kernelized_func
 from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -40,7 +40,7 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.generic import check_model_inputs, maybe_autocast
 from ...utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
-from .configuration_olmo3_5_hybrid import Olmo3_5HybridConfig, Olmo35HybridConfig
+from .configuration_olmo3_5_hybrid import Olmo3_5HybridConfig
 
 
 if is_causal_conv1d_available():
@@ -69,46 +69,24 @@ class _RMSNormNoGateWrapper(nn.Module):
         return self.norm(hidden_states)
 
 
-class Olmo35HybridRMSNormGated(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, **kwargs):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states, gate=None):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        # Norm before gate
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
-
-        return hidden_states.to(input_dtype)
-
-
-class Olmo35HybridDynamicCache:
+class Olmo3_5HybridDynamicCache:
     """
-    A dynamic cache that can handle both the attention cache (which has a seq_len dimension) and the linear attention
-    cache (which has a constant shape regardless of seq_len).
+    Cache capable of storing both:
+      - attention KV caches for attention layers
+      - convolution + recurrent state for linear (GatedDeltaNet) layers
 
-    This cache has two sets of lists of tensors: `key_cache` and `value_cache` for attention cache and `conv_states`
-    and `ssm_states` for gated deltanet cache. Each of these lists has `num_layers` tensors. The expected shape for each tensor
-    For attention layers, `key_cache` and `value_cache` have a shape of `(batch_size, num_heads, seq_len, head_dim)`,
-    while `conv_states` and `ssm_states` have a shape of `(batch_size, 0)` (empty tensors).
-    For linear attention layers, `key_cache` and `value_cache` have a shape of `(batch_size, 0)` (empty tensors),
-    while `conv_states` represents the convolution state and has a shape of `(batch_size, d_inner, d_conv)`,
-    and `recurrent_states` represents the recurrent state and has a shape of `(batch_size, d_inner, d_state)`.
+    Inherits the implementation from Qwen3Next and widens the notion of
+    "attention layers" to include both full and sliding attention.
     """
 
     is_compileable = False
 
-    def __init__(self, config: Olmo35HybridConfig):
+    def __init__(self, config: Olmo3_5HybridConfig):
         super().__init__()
         self.layer_types = config.layer_types
-        self.transformer_layers = [
-            i for i in range(config.num_hidden_layers) if self.layer_types[i] == "full_attention"
-        ]
+        # Qwen3NextDynamicCache only considers "full_attention" layers as transformer layers.
+        # Here we treat any non-linear layer type as an attention layer (full or sliding).
+        self.transformer_layers = [i for i, t in enumerate(config.layer_types) if t != "linear_attention"]
         self.last_linear_layer = len(self.layer_types) - 1 - self.layer_types[::-1].index("linear_attention")
 
         # Initialize everything to None -> will be lazy initialized to allow multi-gpu (device_map) inference
@@ -175,6 +153,24 @@ class Olmo35HybridDynamicCache:
     def has_previous_state(self):
         """We have a previous state if the last linear (conv) layer was already updated."""
         return self.conv_states[self.last_linear_layer] is not None
+
+
+class Olmo3_5HybridRMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, gate=None):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+
+        return hidden_states.to(input_dtype)
 
 
 def apply_mask_to_padding_states(hidden_states, attention_mask):
@@ -390,7 +386,7 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
 
         self.norm = (
-            Olmo35HybridRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+            Olmo3_5HybridRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
             if FusedRMSNormGated is None
             else FusedRMSNormGated(
                 self.head_v_dim,
@@ -462,7 +458,7 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Optional[Olmo35HybridDynamicCache] = None,
+        cache_params: Optional[Olmo3_5HybridDynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
@@ -589,154 +585,11 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         return self._recurrent_gated_delta_rule_impl(*args, **kwargs)
 
 
-class Olmo3_5HybridDynamicCache:
-    """
-    Cache capable of storing both:
-      - attention KV caches for attention layers
-      - convolution + recurrent state for linear (GatedDeltaNet) layers
-
-    Inherits the implementation from Qwen3Next and widens the notion of
-    "attention layers" to include both full and sliding attention.
-    """
-
-    is_compileable = False
-
-    def __init__(self, config: Olmo3_5HybridConfig):
-        super().__init__()
-        self.layer_types = config.layer_types
-        # Qwen3NextDynamicCache only considers "full_attention" layers as transformer layers.
-        # Here we treat any non-linear layer type as an attention layer (full or sliding).
-        self.transformer_layers = [i for i, t in enumerate(config.layer_types) if t != "linear_attention"]
-        self.last_linear_layer = len(self.layer_types) - 1 - self.layer_types[::-1].index("linear_attention")
-
-        # Initialize everything to None -> will be lazy initialized to allow multi-gpu (device_map) inference
-        self.conv_states = [None for _ in range(config.num_hidden_layers)]
-        self.recurrent_states = [None for _ in range(config.num_hidden_layers)]
-        self.key_cache = [None for _ in range(config.num_hidden_layers)]
-        self.value_cache = [None for _ in range(config.num_hidden_layers)]
-
-    def __len__(self):
-        return len(self.layer_types)
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        cache_kwargs: Optional[dict[str, Any]] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.key_cache[layer_idx] is None:
-            self.key_cache[layer_idx] = key_states
-            self.value_cache[layer_idx] = value_states
-        else:
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
-
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-
-    def reorder_cache(self, beam_idx: torch.LongTensor):
-        """Reorders the cache for beam search, given the selected beam indices."""
-        for layer_idx in range(len(self.key_cache)):
-            if self.key_cache[layer_idx] is not None:
-                device = self.key_cache[layer_idx].device
-                beam_idx = beam_idx.to(device)
-                self.key_cache[layer_idx] = self.key_cache[layer_idx].index_select(0, beam_idx)
-                self.value_cache[layer_idx] = self.value_cache[layer_idx].index_select(0, beam_idx)
-
-            if self.conv_states[layer_idx] is not None:
-                device = self.conv_states[layer_idx].device
-                beam_idx = beam_idx.to(device)
-                self.conv_states[layer_idx] = self.conv_states[layer_idx].index_select(0, beam_idx)
-                self.recurrent_states[layer_idx] = self.recurrent_states[layer_idx].index_select(0, beam_idx)
-
-    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
-        # take any layer that contains cache and not empty tensor
-        layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
-        if len(self.key_cache) <= layer_idx or self.key_cache[layer_idx] is None:
-            return 0
-        return self.key_cache[layer_idx].shape[-2]
-
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
-        """
-        Return a tuple (kv_length, kv_offset) corresponding to the length and offset that will be returned for
-        the given layer at `layer_idx`.
-        The masks are then prepared according to the given lengths (kv_length, kv_offset) and patterns for each layer.
-        """
-        kv_offset = 0
-        query_length = cache_position.shape[0]
-        past_seen_tokens = self.get_seq_length(layer_idx)
-        kv_length = query_length + past_seen_tokens
-        return kv_length, kv_offset
-
-    @property
-    def has_previous_state(self):
-        """We have a previous state if the last linear (conv) layer was already updated."""
-        return self.conv_states[self.last_linear_layer] is not None
-
-
-class Olmo3_5HybridDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-
-        self.layer_type = config.layer_types[layer_idx]
-        if self.layer_type == "linear_attention":
-            self.linear_attn = Olmo3_5HybridGatedDeltaNet(config, layer_idx=layer_idx)
-        else:
-            self.self_attn = Olmo3Attention(config=config, layer_idx=layer_idx)
-
-        self.mlp = Olmo3MLP(config)
-        self.post_attention_layernorm = Olmo3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Olmo3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-
-        if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn(
-                hidden_states=hidden_states,
-                cache_params=past_key_values,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-            )
-        else:
-            hidden_states, _ = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
-
-
 @use_kernel_forward_from_hub("RMSNorm")
-class Olmo35HybridRMSNorm(nn.Module):
+class Olmo3_5HybridRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        Olmo35HybridRMSNorm is equivalent to T5LayerNorm
+        Olmo3_5HybridRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -827,10 +680,10 @@ def rotate_half(x):
 
 
 @use_kernelized_func(apply_rotary_pos_emb)
-class Olmo35HybridAttention(nn.Module):
+class Olmo3_5HybridAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Olmo35HybridConfig, layer_idx: int):
+    def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -852,8 +705,8 @@ class Olmo35HybridAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Olmo35HybridRMSNorm(config.num_attention_heads * self.head_dim, config.rms_norm_eps)
-        self.k_norm = Olmo35HybridRMSNorm(config.num_key_value_heads * self.head_dim, config.rms_norm_eps)
+        self.q_norm = Olmo3_5HybridRMSNorm(config.num_attention_heads * self.head_dim, config.rms_norm_eps)
+        self.k_norm = Olmo3_5HybridRMSNorm(config.num_key_value_heads * self.head_dim, config.rms_norm_eps)
         assert config.layer_types is not None
         self.attention_type = config.layer_types[layer_idx]
         self.sliding_window = config.sliding_window if self.attention_type == "sliding_attention" else None
@@ -907,7 +760,7 @@ class Olmo35HybridAttention(nn.Module):
         return attn_output, attn_weights
 
 
-class Olmo35HybridMLP(nn.Module):
+class Olmo3_5HybridMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -923,42 +776,56 @@ class Olmo35HybridMLP(nn.Module):
         return down_proj
 
 
-class Olmo35HybridDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Olmo35HybridConfig, layer_idx: int):
+class Olmo3_5HybridDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Olmo35HybridAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = Olmo3_5HybridAttention(config=config, layer_idx=layer_idx)
 
-        self.mlp = Olmo35HybridMLP(config)
-        self.post_attention_layernorm = Olmo35HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Olmo35HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = Olmo3_5HybridMLP(config)
+        self.post_attention_layernorm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.layer_type = config.layer_types[layer_idx]
+        if self.layer_type == "linear_attention":
+            self.linear_attn = Olmo3_5HybridGatedDeltaNet(config, layer_idx=layer_idx)
+            del self.self_attn  # Remove the attention created by parent
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(
+                hidden_states=hidden_states,
+                cache_params=past_key_values,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+            )
+        else:
+            hidden_states, _ = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
@@ -968,10 +835,10 @@ class Olmo35HybridDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class Olmo3_5HybridPreTrainedModel(PreTrainedModel):
-    config: Olmo35HybridConfig
+    config: Olmo3_5HybridConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Olmo35HybridDecoderLayer"]
+    _no_split_modules = ["Olmo3_5HybridDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -980,15 +847,15 @@ class Olmo3_5HybridPreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
-        "hidden_states": Olmo35HybridDecoderLayer,
-        "attentions": Olmo35HybridAttention,
+        "hidden_states": Olmo3_5HybridDecoderLayer,
+        "attentions": Olmo3_5HybridAttention,
     }
 
 
-class Olmo35HybridRotaryEmbedding(nn.Module):
+class Olmo3_5HybridRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: Olmo35HybridConfig, device=None):
+    def __init__(self, config: Olmo3_5HybridConfig, device=None):
         super().__init__()
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
@@ -1006,7 +873,7 @@ class Olmo35HybridRotaryEmbedding(nn.Module):
 
     @staticmethod
     def compute_default_rope_parameters(
-        config: Optional[Olmo35HybridConfig] = None,
+        config: Optional[Olmo3_5HybridConfig] = None,
         device: Optional["torch.device"] = None,
         seq_len: Optional[int] = None,
     ) -> tuple["torch.Tensor", float]:
@@ -1051,26 +918,7 @@ class Olmo35HybridRotaryEmbedding(nn.Module):
 
 
 @auto_docstring
-class Olmo35HybridPreTrainedModel(PreTrainedModel):
-    config: Olmo35HybridConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["Olmo35HybridDecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
-    _can_record_outputs = {
-        "hidden_states": Olmo35HybridDecoderLayer,
-        "attentions": Olmo35HybridAttention,
-    }
-
-
-@auto_docstring
-class Olmo3_5HybridModel(Olmo35HybridPreTrainedModel):
+class Olmo3_5HybridModel(Olmo3_5HybridPreTrainedModel):
     def __init__(self, config: Olmo3_5HybridConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -1080,8 +928,8 @@ class Olmo3_5HybridModel(Olmo35HybridPreTrainedModel):
         self.layers = nn.ModuleList(
             [Olmo3_5HybridDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Olmo35HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Olmo35HybridRotaryEmbedding(config=config)
+        self.norm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Olmo3_5HybridRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         # Call custom init after post_init
         self._init_hybrid_weights()
@@ -1170,7 +1018,7 @@ class Olmo3_5HybridModel(Olmo35HybridPreTrainedModel):
     @torch.no_grad()
     def _init_hybrid_weights(self):
         for module in self.modules():
-            if isinstance(module, Qwen3NextGatedDeltaNet):
+            if isinstance(module, Olmo3_5HybridGatedDeltaNet):
                 init.ones_(module.dt_bias)
                 init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
 
@@ -1191,101 +1039,14 @@ class Olmo3_5HybridModel(Olmo35HybridPreTrainedModel):
 
 
 @auto_docstring
-class Olmo35HybridModel(Olmo35HybridPreTrainedModel):
-    def __init__(self, config: Olmo35HybridConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Olmo35HybridDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = Olmo35HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Olmo35HybridRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @check_model_inputs
-    @auto_docstring
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if inputs_embeds is None:
-            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
-
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position: torch.Tensor = (
-                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            )
-
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-        # It may already have been prepared by e.g. `generate`
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
-
-        hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.self_attn.attention_type],
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-        hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
-        )
-
-
-@auto_docstring
-class Olmo3_5HybridForCausalLM(Olmo35HybridPreTrainedModel, GenerationMixin):
+class Olmo3_5HybridForCausalLM(Olmo3_5HybridPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Olmo35HybridModel(config)
+        self.model = Olmo3_5HybridModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1311,10 +1072,10 @@ class Olmo3_5HybridForCausalLM(Olmo35HybridPreTrainedModel, GenerationMixin):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, Olmo35HybridForCausalLM
+        >>> from transformers import AutoTokenizer, Olmo3_5HybridForCausalLM
 
-        >>> model = Olmo35HybridForCausalLM.from_pretrained("meta-olmo3__5_hybrid/Olmo35Hybrid-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-olmo3__5_hybrid/Olmo35Hybrid-2-7b-hf")
+        >>> model = Olmo3_5HybridForCausalLM.from_pretrained("meta-olmo3_5_hybrid/Olmo3_5Hybrid-2-7b-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-olmo3_5_hybrid/Olmo3_5Hybrid-2-7b-hf")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
