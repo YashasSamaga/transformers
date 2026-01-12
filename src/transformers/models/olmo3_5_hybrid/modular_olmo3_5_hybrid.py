@@ -539,7 +539,7 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-
+        
         q, new_conv_state_q = self.q_conv1d(
             x=q,
             cache=conv_state_q,
@@ -555,6 +555,7 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
             cache=conv_state_v,
             output_final_state=use_cache,
         )
+
 
         if cache_params is not None:
             cache_params.conv_states_q[self.layer_idx] = new_conv_state_q
@@ -580,7 +581,10 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
 
-        if use_precomputed:
+        # Match FLA's GatedDeltaNet behavior: use fused_recurrent for short sequences during inference
+        use_recurrent_mode = use_precomputed or (seq_len <= 64 and not self.training)
+
+        if use_recurrent_mode:
             output, new_recurrent_state = self.recurrent_gated_delta_rule(
                 q, k, v, g=g, beta=beta,
                 initial_state=recurrent_state,

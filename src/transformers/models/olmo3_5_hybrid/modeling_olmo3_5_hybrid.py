@@ -523,7 +523,10 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
 
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
 
-        if use_precomputed:
+        # Match FLA's GatedDeltaNet behavior: use fused_recurrent for short sequences during inference
+        use_recurrent_mode = use_precomputed or (seq_len <= 64 and not self.training)
+
+        if use_recurrent_mode:
             output, new_recurrent_state = self.recurrent_gated_delta_rule(
                 q,
                 k,
