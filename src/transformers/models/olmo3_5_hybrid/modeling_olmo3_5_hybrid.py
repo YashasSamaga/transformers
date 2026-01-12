@@ -38,21 +38,17 @@ from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.generic import check_model_inputs, maybe_autocast
-from ...utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
+from ...utils.import_utils import is_flash_linear_attention_available
 from .configuration_olmo3_5_hybrid import Olmo3_5HybridConfig
 
 
-if is_causal_conv1d_available():
-    from causal_conv1d import causal_conv1d_fn
-else:
-    causal_conv1d_update, causal_conv1d_fn = None, None
-
 if is_flash_linear_attention_available():
-    from fla.modules import FusedRMSNormGated
+    from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 else:
     chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
     FusedRMSNormGated = None
+    ShortConvolution = None
 
 
 logger = logging.get_logger(__name__)
@@ -61,6 +57,8 @@ logger = logging.get_logger(__name__)
 class Olmo3_5HybridDynamicCache:
     """
     Cache for hybrid model supporting both attention KV cache and linear attention state.
+
+    Adapted from transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextDynamicCache
     """
 
     is_compileable = False
@@ -150,7 +148,6 @@ class Olmo3_5HybridRMSNormGated(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         hidden_states = self.weight * hidden_states.to(input_dtype)
-        # Apply gate after norm (matching FLA)
         hidden_states = hidden_states * F.silu(gate)
         return hidden_states
 
@@ -169,6 +166,68 @@ class Olmo3_5HybridRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         return (self.weight * hidden_states).to(input_dtype)
+
+
+# Fallback ShortConvolution implementation when FLA is not available.
+class Olmo3_5HybridShortConvolution(nn.Conv1d):
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int,
+        bias: bool = False,
+    ):
+        super().__init__(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=kernel_size,
+            groups=hidden_size,
+            padding=kernel_size - 1,
+            bias=bias,
+        )
+        self.hidden_size = hidden_size
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: torch.Tensor | None = None,
+        output_final_state: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        B, T, D = x.shape
+        W = self.kernel_size[0]
+
+        x_conv = x.transpose(1, 2)
+
+        # Single token update (decoding mode)
+        if cache is not None and T == 1:
+            x_with_state = torch.cat([cache, x_conv], dim=-1)
+
+            out = F.conv1d(
+                x_with_state,
+                self.weight,
+                self.bias,
+                padding=0,
+                groups=D,
+            )
+            out = F.silu(out)
+
+            new_state = x_with_state[:, :, 1:]
+
+            return out.transpose(1, 2), new_state
+
+        # Multi-token forward (prefill mode)
+        else:
+            out = super().forward(x_conv)[:, :, :T]
+            out = F.silu(out)
+
+            if output_final_state:
+                if T >= W - 1:
+                    new_state = x_conv[:, :, -(W - 1) :]
+                else:
+                    new_state = F.pad(x_conv, (W - 1 - T, 0))
+            else:
+                new_state = None
+
+            return out.transpose(1, 2), new_state
 
 
 def apply_mask_to_padding_states(hidden_states, attention_mask):
@@ -312,10 +371,6 @@ def torch_recurrent_gated_delta_rule(
 
 
 class Olmo3_5HybridGatedDeltaNet(nn.Module):
-    """
-    GatedDeltaNet implementation matching FLA library architecture.
-    """
-
     def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -342,37 +397,49 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
 
         self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-        self.q_conv1d = nn.Conv1d(
-            self.key_dim,
-            self.key_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.key_dim,
-            padding=self.conv_kernel_size - 1,
-            bias=False,
-        )
-        self.k_conv1d = nn.Conv1d(
-            self.key_dim,
-            self.key_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.key_dim,
-            padding=self.conv_kernel_size - 1,
-            bias=False,
-        )
-        self.v_conv1d = nn.Conv1d(
-            self.value_dim,
-            self.value_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.value_dim,
-            padding=self.conv_kernel_size - 1,
-            bias=False,
-        )
+        self.use_fla_conv = ShortConvolution is not None
+
+        if self.use_fla_conv:
+            self.q_conv1d = ShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+                activation="silu",
+            )
+            self.k_conv1d = ShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+                activation="silu",
+            )
+            self.v_conv1d = ShortConvolution(
+                hidden_size=self.value_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+                activation="silu",
+            )
+        else:
+            self.q_conv1d = Olmo3_5HybridShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+            )
+            self.k_conv1d = Olmo3_5HybridShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+            )
+            self.v_conv1d = Olmo3_5HybridShortConvolution(
+                hidden_size=self.value_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+            )
 
         self.A_log = nn.Parameter(torch.zeros(self.num_heads))
         self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
 
-        # Output norm - NOTE: FLA's FusedRMSNormGated uses eps=1e-5 by default,
-        # not the config's rms_norm_eps which is typically 1e-6
-        o_norm_eps = 1e-5  # Match FLA's default
+        # Output norm - NOTE: FLA's FusedRMSNormGated uses eps=1e-5 by default
+        o_norm_eps = 1e-5
         if self.use_gate:
             if FusedRMSNormGated is not None:
                 self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=o_norm_eps)
@@ -384,26 +451,11 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
-        if not all([chunk_gated_delta_rule, fused_recurrent_gated_delta_rule, causal_conv1d_fn]):
+        if not is_flash_linear_attention_available():
             logger.warning_once(
-                "FLA fast path not available. Install flash-linear-attention and causal-conv1d for better performance."
+                "FLA fast path not available. Install flash-linear-attention for better performance. "
+                "See: https://github.com/fla-org/flash-linear-attention"
             )
-
-    def _conv_forward(self, x: torch.Tensor, conv: nn.Conv1d, conv_state: torch.Tensor | None, seq_len: int):
-        """Apply convolution with SiLU activation, matching FLA's ShortConvolution."""
-        x = x.transpose(1, 2)
-
-        if conv_state is not None and x.shape[-1] == 1:
-            x_with_state = torch.cat([conv_state, x], dim=-1)
-            new_state = x_with_state[:, :, -self.conv_kernel_size + 1 :]
-            out = F.conv1d(x_with_state, conv.weight, conv.bias, padding=0, groups=conv.weight.shape[0])
-            out = F.silu(out)
-        else:
-            out = conv(x)[:, :, :seq_len]
-            out = F.silu(out)
-            new_state = F.pad(x, (self.conv_kernel_size - x.shape[-1], 0))[:, :, -self.conv_kernel_size + 1 :]
-
-        return out.transpose(1, 2), new_state
 
     def forward(
         self,
@@ -427,9 +479,21 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        q, new_conv_state_q = self._conv_forward(q, self.q_conv1d, conv_state_q, seq_len)
-        k, new_conv_state_k = self._conv_forward(k, self.k_conv1d, conv_state_k, seq_len)
-        v, new_conv_state_v = self._conv_forward(v, self.v_conv1d, conv_state_v, seq_len)
+        q, new_conv_state_q = self.q_conv1d(
+            x=q,
+            cache=conv_state_q,
+            output_final_state=use_cache,
+        )
+        k, new_conv_state_k = self.k_conv1d(
+            x=k,
+            cache=conv_state_k,
+            output_final_state=use_cache,
+        )
+        v, new_conv_state_v = self.v_conv1d(
+            x=v,
+            cache=conv_state_v,
+            output_final_state=use_cache,
+        )
 
         if cache_params is not None:
             cache_params.conv_states_q[self.layer_idx] = new_conv_state_q
@@ -674,20 +738,6 @@ class Olmo3_5HybridMLP(nn.Module):
 
 
 class Olmo3_5HybridDecoderLayer(GradientCheckpointingLayer):
-    """
-    Decoder layer for OLMo 3.5 Hybrid model.
-
-    IMPORTANT: The norm placement differs between layer types:
-
-    For LINEAR ATTENTION layers (matching OLMo-core FLABlock):
-        h = x + fla(fla_norm(x))  # Norm BEFORE FLA
-        h = h + mlp(mlp_norm(h))  # Norm BEFORE MLP
-
-    For ATTENTION layers (matching OLMo-core ReorderedNormTransformerBlock):
-        h = x + post_attn_norm(attn(x))  # Norm AFTER attention
-        h = h + post_ff_norm(mlp(h))     # Norm AFTER MLP
-    """
-
     def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
