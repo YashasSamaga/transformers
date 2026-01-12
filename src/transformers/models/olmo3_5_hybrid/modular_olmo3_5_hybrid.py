@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-OLMo 3.5 Hybrid model with GatedDeltaNet linear attention layers.
-"""
-
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -24,8 +20,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ... import initialization as init
-from ...activations import ACT2FN
 from ...cache_utils import Cache
 from ...generation import GenerationMixin
 from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -37,30 +31,26 @@ from ...utils.import_utils import is_flash_linear_attention_available
 
 from ..olmo3.configuration_olmo3 import Olmo3Config
 from ..olmo3.modeling_olmo3 import (
-    Olmo3Attention,
     Olmo3DecoderLayer,
-    Olmo3MLP,
     Olmo3Model,
     Olmo3ForCausalLM,
     Olmo3PreTrainedModel,
-    Olmo3RMSNorm,
-    Olmo3RotaryEmbedding,
 )
 
 from ..qwen3_next.modeling_qwen3_next import (
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
-    l2norm,
     apply_mask_to_padding_states,
 )
 
 
 if is_flash_linear_attention_available():
-    from fla.modules import FusedRMSNormGated
+    from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 else:
     chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
     FusedRMSNormGated = None
+    ShortConvolution = None
 
 
 logger = logging.get_logger(__name__)
@@ -68,10 +58,99 @@ logger = logging.get_logger(__name__)
 
 class Olmo3_5HybridConfig(Olmo3Config):
     r"""
-    OLMo3.5 Hybrid configuration.
+    This is the configuration class to store the configuration of a [`Olmo3_5HybridModel`]. It is used to instantiate
+    an OLMo 3.5 Hybrid model according to the specified arguments, defining the model architecture. Instantiating a
+    configuration with the defaults will yield a similar configuration to that of the OLMo 3.5 Hybrid model.
 
-    This configuration extends :class:`~transformers.Olmo3Config` with parameters
-    for the Gated DeltaNet (linear attention) layers.
+    The OLMo 3.5 Hybrid model combines standard transformer attention layers with GatedDeltaNet linear attention
+    layers for improved efficiency while maintaining model quality.
+
+    Configuration objects inherit from [`Olmo3Config`] and can be used to control the model outputs. Read the
+    documentation from [`PreTrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 100352):
+            Vocabulary size of the Olmo3_5Hybrid model. Defines the number of different tokens that can be represented
+            by the `inputs_ids` passed when calling [`Olmo3_5HybridModel`].
+        hidden_size (`int`, *optional*, defaults to 3840):
+            Dimension of the hidden representations.
+        intermediate_size (`int`, *optional*, defaults to 11008):
+            Dimension of the MLP representations.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer decoder.
+        num_attention_heads (`int`, *optional*, defaults to 30):
+            Number of attention heads for each attention layer in the Transformer decoder.
+        num_key_value_heads (`int`, *optional*):
+            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
+            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
+            `num_key_value_heads=1` the model will use Multi Query Attention (MQA) otherwise GQA is used. When
+            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
+            by meanpooling all the original heads within that group. For more details, check out [this
+            paper](https://huggingface.co/papers/2305.13245). If it is not specified, will default to
+            `num_attention_heads`.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) in the decoder.
+        max_position_embeddings (`int`, *optional*, defaults to 65536):
+            The maximum sequence length that this model might ever be used with.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        pad_token_id (`int`, *optional*, defaults to 100277):
+            Padding token id.
+        bos_token_id (`int`, *optional*):
+            Beginning of stream token id.
+        eos_token_id (`int`, *optional*, defaults to 100257):
+            End of stream token id.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie weight embeddings.
+        rope_parameters (`RopeParameters`, *optional*):
+            Dictionary containing the configuration parameters for the RoPE embeddings. The dictionary should contain
+            a value for `rope_theta` and optionally parameters used for scaling in case you want to use RoPE
+            with longer `max_position_embeddings`.
+        attention_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use a bias in the query, key, value and output projection layers during self-attention.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
+            The epsilon used by the rms normalization layers.
+        sliding_window (`int`, *optional*, defaults to 4096):
+            Size of the sliding window for sliding window attention.
+        layer_types (`list`, *optional*):
+            Attention pattern for each layer. Can contain `"full_attention"`, `"sliding_attention"`, or
+            `"linear_attention"`. Defaults to linear attention for most layers with full attention for every
+            4th layer (determined by `fla_hybrid_attention_indices`).
+        fla_hybrid_attention_indices (`list[int]`, *optional*):
+            List of layer indices that should use full attention instead of linear attention. Defaults to
+            every 4th layer (i.e., layers where `i % 4 == 3`). Only used when `layer_types` is not provided.
+        linear_num_key_heads (`int`, *optional*):
+            Number of key heads for the linear attention layers. Defaults to `num_attention_heads`.
+        linear_num_value_heads (`int`, *optional*):
+            Number of value heads for the linear attention layers. Defaults to `num_attention_heads`.
+        linear_key_head_dim (`int`, *optional*):
+            Dimension of each key head in linear attention layers. Defaults to `0.75 * hidden_size / linear_num_key_heads`.
+        linear_value_head_dim (`int`, *optional*):
+            Dimension of each value head in linear attention layers. Defaults to `2 * linear_key_head_dim`.
+        linear_conv_kernel_dim (`int`, *optional*, defaults to 4):
+            Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
+        linear_use_gate (`bool`, *optional*, defaults to `True`):
+            Whether to use gating in the linear attention output normalization.
+        linear_allow_neg_eigval (`bool`, *optional*, defaults to `True`):
+            Whether to allow negative eigenvalues in the GatedDeltaNet recurrence. When `True`, the beta
+            parameter is scaled by 2.0 to allow values in range [0, 2] instead of [0, 1].
+    ```python
+    >>> from transformers import Olmo3_5HybridModel, Olmo3_5HybridConfig
+
+    >>> # Initializing an Olmo3.5 Hybrid style configuration
+    >>> configuration = Olmo3_5HybridConfig()
+
+    >>> # Initializing a model from the Olmo3.5 Hybrid style configuration
+    >>> model = Olmo3_5HybridModel(configuration)
+
+    >>> # Accessing the model configuration
+    >>> configuration = model.config
+    ```
     """
 
     model_type = "olmo3_5_hybrid"
@@ -99,7 +178,6 @@ class Olmo3_5HybridConfig(Olmo3Config):
         sliding_window: int | None = 4096,
         layer_types: list[str] | None = None,
         fla_hybrid_attention_indices: list[int] | None = None,
-        # Linear (Gated DeltaNet) parameters
         linear_num_key_heads: int | None = None,
         linear_num_value_heads: int | None = None,
         linear_key_head_dim: int | None = None,
@@ -182,6 +260,8 @@ class Olmo3_5HybridConfig(Olmo3Config):
 class Olmo3_5HybridDynamicCache:
     """
     Cache for hybrid model supporting both attention KV cache and linear attention state.
+
+    Adapted from transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextDynamicCache
     """
 
     is_compileable = False
@@ -269,7 +349,6 @@ class Olmo3_5HybridRMSNormGated(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         hidden_states = self.weight * hidden_states.to(input_dtype)
-        # Apply gate after norm (matching FLA)
         hidden_states = hidden_states * F.silu(gate)
         return hidden_states
 
@@ -289,13 +368,70 @@ class Olmo3_5HybridRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         return (self.weight * hidden_states).to(input_dtype)
 
+# Fallback ShortConvolution implementation when FLA is not available.
+class Olmo3_5HybridShortConvolution(nn.Conv1d):
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int,
+        bias: bool = False,
+    ):
+        super().__init__(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=kernel_size,
+            groups=hidden_size,
+            padding=kernel_size - 1,
+            bias=bias,
+        )
+        self.hidden_size = hidden_size
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: torch.Tensor | None = None,
+        output_final_state: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+
+        B, T, D = x.shape
+        W = self.kernel_size[0]
+        
+        x_conv = x.transpose(1, 2)
+        
+        # Single token update (decoding mode)
+        if cache is not None and T == 1:
+            x_with_state = torch.cat([cache, x_conv], dim=-1)
+
+            out = F.conv1d(
+                x_with_state,
+                self.weight,
+                self.bias,
+                padding=0,
+                groups=D,
+            )
+            out = F.silu(out)
+            
+            new_state = x_with_state[:, :, 1:]
+            
+            return out.transpose(1, 2), new_state
+        
+        # Multi-token forward (prefill mode)
+        else:
+            out = super().forward(x_conv)[:, :, :T]
+            out = F.silu(out)
+            
+            if output_final_state:
+                if T >= W - 1:
+                    new_state = x_conv[:, :, -(W - 1):]
+                else:
+                    new_state = F.pad(x_conv, (W - 1 - T, 0))
+            else:
+                new_state = None
+            
+            return out.transpose(1, 2), new_state
 
 
 class Olmo3_5HybridGatedDeltaNet(nn.Module):
-    """
-    GatedDeltaNet implementation matching FLA library architecture.
-    """
-
     def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -322,34 +458,49 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         
         self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-        self.q_conv1d = nn.Conv1d(
-            self.key_dim, self.key_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.key_dim,
-            padding=self.conv_kernel_size - 1,
-            bias=False,
-        )
-        self.k_conv1d = nn.Conv1d(
-            self.key_dim, self.key_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.key_dim,
-            padding=self.conv_kernel_size - 1,
-            bias=False,
-        )
-        self.v_conv1d = nn.Conv1d(
-            self.value_dim, self.value_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.value_dim,
-            padding=self.conv_kernel_size - 1,
-            bias=False,
-        )
+        self.use_fla_conv = ShortConvolution is not None
+        
+        if self.use_fla_conv:
+            self.q_conv1d = ShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+                activation='silu',
+            )
+            self.k_conv1d = ShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+                activation='silu',
+            )
+            self.v_conv1d = ShortConvolution(
+                hidden_size=self.value_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+                activation='silu',
+            )
+        else:
+            self.q_conv1d = Olmo3_5HybridShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+            )
+            self.k_conv1d = Olmo3_5HybridShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+            )
+            self.v_conv1d = Olmo3_5HybridShortConvolution(
+                hidden_size=self.value_dim,
+                kernel_size=self.conv_kernel_size,
+                bias=False,
+            )
 
         self.A_log = nn.Parameter(torch.zeros(self.num_heads))
         self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
 
-        # Output norm - NOTE: FLA's FusedRMSNormGated uses eps=1e-5 by default,
-        # not the config's rms_norm_eps which is typically 1e-6
-        o_norm_eps = 1e-5  # Match FLA's default
+        # Output norm - NOTE: FLA's FusedRMSNormGated uses eps=1e-5 by default
+        o_norm_eps = 1e-5
         if self.use_gate:
             if FusedRMSNormGated is not None:
                 self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=o_norm_eps)
@@ -361,26 +512,11 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
-        if not all([chunk_gated_delta_rule, fused_recurrent_gated_delta_rule]):
+        if not is_flash_linear_attention_available():
             logger.warning_once(
-                "FLA fast path not available. Install flash-linear-attention and causal-conv1d for better performance."
+                "FLA fast path not available. Install flash-linear-attention for better performance. "
+                "See: https://github.com/fla-org/flash-linear-attention"
             )
-
-    def _conv_forward(self, x: torch.Tensor, conv: nn.Conv1d, conv_state: torch.Tensor | None, seq_len: int):
-        """Apply convolution with SiLU activation, matching FLA's ShortConvolution."""
-        x = x.transpose(1, 2)
-        
-        if conv_state is not None and x.shape[-1] == 1:
-            x_with_state = torch.cat([conv_state, x], dim=-1)
-            new_state = x_with_state[:, :, -self.conv_kernel_size + 1:]
-            out = F.conv1d(x_with_state, conv.weight, conv.bias, padding=0, groups=conv.weight.shape[0])
-            out = F.silu(out)
-        else:
-            out = conv(x)[:, :, :seq_len]
-            out = F.silu(out)
-            new_state = F.pad(x, (self.conv_kernel_size - x.shape[-1], 0))[:, :, -self.conv_kernel_size + 1:]
-        
-        return out.transpose(1, 2), new_state
 
     def forward(
         self,
@@ -404,9 +540,21 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        q, new_conv_state_q = self._conv_forward(q, self.q_conv1d, conv_state_q, seq_len)
-        k, new_conv_state_k = self._conv_forward(k, self.k_conv1d, conv_state_k, seq_len)
-        v, new_conv_state_v = self._conv_forward(v, self.v_conv1d, conv_state_v, seq_len)
+        q, new_conv_state_q = self.q_conv1d(
+            x=q,
+            cache=conv_state_q,
+            output_final_state=use_cache,
+        )
+        k, new_conv_state_k = self.k_conv1d(
+            x=k,
+            cache=conv_state_k,
+            output_final_state=use_cache,
+        )
+        v, new_conv_state_v = self.v_conv1d(
+            x=v,
+            cache=conv_state_v,
+            output_final_state=use_cache,
+        )
 
         if cache_params is not None:
             cache_params.conv_states_q[self.layer_idx] = new_conv_state_q
@@ -419,8 +567,12 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
 
         if self.num_heads > self.num_kv_heads:
             expand_ratio = self.num_heads // self.num_kv_heads
-            q = q.unsqueeze(3).expand(-1, -1, -1, expand_ratio, -1).reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
-            k = k.unsqueeze(3).expand(-1, -1, -1, expand_ratio, -1).reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
+            q = q.unsqueeze(3).expand(-1, -1, -1, expand_ratio, -1).reshape(
+                batch_size, seq_len, self.num_heads, self.head_k_dim
+            )
+            k = k.unsqueeze(3).expand(-1, -1, -1, expand_ratio, -1).reshape(
+                batch_size, seq_len, self.num_heads, self.head_k_dim
+            )
 
         beta = self.b_proj(hidden_states).sigmoid()
         if self.allow_neg_eigval:
@@ -465,20 +617,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
 
 
 class Olmo3_5HybridDecoderLayer(Olmo3DecoderLayer):
-    """
-    Decoder layer for OLMo 3.5 Hybrid model.
-    
-    IMPORTANT: The norm placement differs between layer types:
-    
-    For LINEAR ATTENTION layers (matching OLMo-core FLABlock):
-        h = x + fla(fla_norm(x))  # Norm BEFORE FLA
-        h = h + mlp(mlp_norm(h))  # Norm BEFORE MLP
-    
-    For ATTENTION layers (matching OLMo-core ReorderedNormTransformerBlock):
-        h = x + post_attn_norm(attn(x))  # Norm AFTER attention
-        h = h + post_ff_norm(mlp(h))     # Norm AFTER MLP
-    """
-    
     def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         
