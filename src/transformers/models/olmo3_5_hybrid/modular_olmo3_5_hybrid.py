@@ -35,6 +35,7 @@ from ..olmo3.modeling_olmo3 import (
     Olmo3Model,
     Olmo3ForCausalLM,
     Olmo3PreTrainedModel,
+    Olmo3RotaryEmbedding
 )
 
 from ..qwen3_next.modeling_qwen3_next import (
@@ -520,6 +521,31 @@ def pad_input(
     )
     output.index_copy_(0, indices, hidden_states)
     return output.view(batch_size, seq_len, *hidden_states.shape[1:])
+
+
+class Olmo3_5HybridRotaryEmbedding(Olmo3RotaryEmbedding):
+    """
+    RoPE for OLMo 3.5 Hybrid that returns float32 cos/sin to match OLMo-core.
+    
+    The only difference from parent is NOT casting cos/sin back to x.dtype,
+    preserving float32 precision like OLMo-core's full_precision=True.
+    """
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        # KEY FIX: Return float32, don't cast to x.dtype
+        return cos, sin
+
 
 
 class Olmo3_5HybridGatedDeltaNet(nn.Module):
