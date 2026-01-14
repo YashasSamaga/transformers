@@ -431,6 +431,97 @@ class Olmo3_5HybridShortConvolution(nn.Conv1d):
             return out.transpose(1, 2), new_state
 
 
+
+def prepare_lens_from_mask(mask: torch.BoolTensor) -> torch.LongTensor:
+    """Compute sequence lengths from attention mask."""
+    return mask.sum(dim=-1, dtype=torch.int32)
+
+
+def prepare_cu_seqlens_from_lens(
+    lens: torch.LongTensor,
+    dtype: Optional[torch.dtype] = torch.int32,
+) -> torch.LongTensor:
+    """Compute cumulative sequence lengths from lengths."""
+    return F.pad(lens.cumsum(dim=0, dtype=dtype), (1, 0))
+
+
+def prepare_cu_seqlens_from_mask(
+    mask: torch.BoolTensor,
+    dtype: Optional[torch.dtype] = torch.int32,
+) -> torch.LongTensor:
+    """Compute cumulative sequence lengths from attention mask."""
+    return prepare_cu_seqlens_from_lens(prepare_lens_from_mask(mask), dtype)
+
+
+def get_unpad_data(
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Retrieves indexing data required to repad unpadded (ragged) tensors.
+
+    Args:
+        attention_mask (`torch.Tensor`):
+            Boolean or int tensor of shape (batch_size, sequence_length), 
+            1 means valid and 0 means not valid.
+
+    Return:
+        indices (`torch.Tensor`):
+            The indices of non-masked tokens from the flattened input sequence.
+        cu_seqlens (`torch.Tensor`):
+            The cumulative sequence lengths, used to index into ragged (unpadded) tensors.
+            `cu_seqlens` shape is [batch_size + 1].
+        max_seqlen_in_batch (`int`):
+            Maximum sequence length in batch.
+    """
+    lens = prepare_lens_from_mask(attention_mask)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = lens.max().item()
+    cu_seqlens = prepare_cu_seqlens_from_mask(attention_mask)
+    return indices, cu_seqlens, max_seqlen_in_batch
+
+
+def index_first_axis(input_tensor: torch.Tensor, indices: torch.LongTensor) -> torch.Tensor:
+    """
+    Index the first axis of a tensor using the given indices.
+    
+    Args:
+        input_tensor: Tensor of shape (total_tokens, ...)
+        indices: 1D tensor of indices to select
+    
+    Returns:
+        Tensor of shape (len(indices), ...)
+    """
+    return torch.index_select(input_tensor, 0, indices)
+
+
+def pad_input(
+    hidden_states: torch.Tensor,
+    indices: torch.LongTensor,
+    batch_size: int,
+    seq_len: int,
+) -> torch.Tensor:
+    """
+    Pad the hidden states back to the original batch/seq shape.
+    
+    Args:
+        hidden_states: Tensor of shape (total_tokens, hidden_size)
+        indices: The indices used for unpacking
+        batch_size: Original batch size
+        seq_len: Original sequence length
+    
+    Returns:
+        Tensor of shape (batch_size, seq_len, hidden_size)
+    """
+    output = torch.zeros(
+        batch_size * seq_len,
+        *hidden_states.shape[1:],
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    output.index_copy_(0, indices, hidden_states)
+    return output.view(batch_size, seq_len, *hidden_states.shape[1:])
+
+
 class Olmo3_5HybridGatedDeltaNet(nn.Module):
     def __init__(self, config: Olmo3_5HybridConfig, layer_idx: int):
         super().__init__()
@@ -525,11 +616,24 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
 
         use_cache = cache_params is not None
         use_precomputed = use_cache and cache_params.has_previous_state and seq_len == 1
+
+        indices = None
+        cu_seqlens = None
+        if attention_mask is not None and attention_mask.shape[1] > 1:
+            # Check if there's actual padding (not all ones)
+            if not torch.all(attention_mask == 1):
+                indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -seq_len:])
+                # Flatten and select non-padded tokens
+                hidden_states = index_first_axis(
+                    hidden_states.reshape(-1, hidden_states.shape[-1]), 
+                    indices
+                ).unsqueeze(0)
+                # Update seq_len to reflect unpacked length
+                seq_len = hidden_states.shape[1]
 
         conv_state_q = cache_params.conv_states_q[self.layer_idx] if cache_params else None
         conv_state_k = cache_params.conv_states_k[self.layer_idx] if cache_params else None
@@ -540,39 +644,46 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
         
+        conv_kwargs = {"output_final_state": use_cache}
+        if self.use_fla_conv and cu_seqlens is not None:
+            conv_kwargs["cu_seqlens"] = cu_seqlens
+
         q, new_conv_state_q = self.q_conv1d(
             x=q,
             cache=conv_state_q,
-            output_final_state=use_cache,
+            **conv_kwargs,
         )
         k, new_conv_state_k = self.k_conv1d(
             x=k,
             cache=conv_state_k,
-            output_final_state=use_cache,
+            **conv_kwargs,
         )
         v, new_conv_state_v = self.v_conv1d(
             x=v,
             cache=conv_state_v,
-            output_final_state=use_cache,
+            **conv_kwargs,
         )
-
 
         if cache_params is not None:
             cache_params.conv_states_q[self.layer_idx] = new_conv_state_q
             cache_params.conv_states_k[self.layer_idx] = new_conv_state_k
             cache_params.conv_states_v[self.layer_idx] = new_conv_state_v
 
-        q = q.view(batch_size, seq_len, self.num_kv_heads, self.head_k_dim)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_k_dim)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_v_dim)
+        q = q.view(batch_size if indices is None else 1, seq_len, self.num_kv_heads, self.head_k_dim)
+        k = k.view(batch_size if indices is None else 1, seq_len, self.num_kv_heads, self.head_k_dim)
+        v = v.view(batch_size if indices is None else 1, seq_len, self.num_heads, self.head_v_dim)
 
         if self.num_heads > self.num_kv_heads:
             expand_ratio = self.num_heads // self.num_kv_heads
-            q = q.unsqueeze(3).expand(-1, -1, -1, expand_ratio, -1).reshape(
-                batch_size, seq_len, self.num_heads, self.head_k_dim
+            q = (
+                q.unsqueeze(3)
+                .expand(-1, -1, -1, expand_ratio, -1)
+                .reshape(batch_size if indices is None else 1, seq_len, self.num_heads, self.head_k_dim)
             )
-            k = k.unsqueeze(3).expand(-1, -1, -1, expand_ratio, -1).reshape(
-                batch_size, seq_len, self.num_heads, self.head_k_dim
+            k = (
+                k.unsqueeze(3)
+                .expand(-1, -1, -1, expand_ratio, -1)
+                .reshape(batch_size if indices is None else 1, seq_len, self.num_heads, self.head_k_dim)
             )
 
         beta = self.b_proj(hidden_states).sigmoid()
@@ -584,19 +695,29 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         # Match FLA's GatedDeltaNet behavior: use fused_recurrent for short sequences during inference
         use_recurrent_mode = use_precomputed or (seq_len <= 64 and not self.training)
 
+        delta_kwargs = {
+            "initial_state": recurrent_state,
+            "output_final_state": use_cache,
+            "use_qk_l2norm_in_kernel": True,
+        }
+        
+        # Pass cu_seqlens if available and using FLA kernels
+        if cu_seqlens is not None and is_flash_linear_attention_available():
+            delta_kwargs["cu_seqlens"] = cu_seqlens
+
         if use_recurrent_mode:
             output, new_recurrent_state = self.recurrent_gated_delta_rule(
-                q, k, v, g=g, beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                use_qk_l2norm_in_kernel=True,
+                q, k, v,
+                g=g,
+                beta=beta,
+                **delta_kwargs,
             )
         else:
             output, new_recurrent_state = self.chunk_gated_delta_rule(
-                q, k, v, g=g, beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                use_qk_l2norm_in_kernel=True,
+                q, k, v,
+                g=g,
+                beta=beta,
+                **delta_kwargs,
             )
 
         if cache_params is not None:
@@ -605,17 +726,24 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
         if self.use_gate:
             gate = self.g_proj(hidden_states)
             gate = gate.view(batch_size, seq_len, self.num_heads, self.head_v_dim)
-            output = output.reshape(-1, self.head_v_dim)
-            gate = gate.reshape(-1, self.head_v_dim)
-            output = self.o_norm(output, gate)
-            output = output.view(batch_size, seq_len, self.num_heads, self.head_v_dim)
+            if FusedRMSNormGated is not None:
+                output = self.o_norm(output, gate)
+            else:
+                output = output.reshape(-1, self.head_v_dim)
+                gate = gate.reshape(-1, self.head_v_dim)
+                output = self.o_norm(output, gate)
+                output = output.view(batch_size, seq_len, self.num_heads, self.head_v_dim)
         else:
             output = output.reshape(-1, self.head_v_dim)
             output = self.o_norm(output)
-            output = output.view(batch_size, seq_len, self.num_heads, self.head_v_dim)
+            output = output.view(batch_size if indices is None else 1, seq_len, self.num_heads, self.head_v_dim)
 
-        output = output.reshape(batch_size, seq_len, self.value_dim)
+        output = output.reshape(batch_size if indices is None else 1, seq_len, self.value_dim)
         output = self.o_proj(output)
+
+        # Pad output back to original shape if we unpacked
+        if indices is not None:
+            output = pad_input(output.squeeze(0), indices, batch_size, attention_mask.shape[-1])
 
         return output
 
