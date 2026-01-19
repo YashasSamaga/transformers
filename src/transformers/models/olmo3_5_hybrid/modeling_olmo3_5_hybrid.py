@@ -21,7 +21,7 @@
 
 import math
 from collections.abc import Callable
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -85,7 +85,7 @@ class Olmo3_5HybridDynamicCache:
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         layer_idx: int,
-        cache_kwargs: Optional[dict[str, Any]] = None,
+        cache_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.key_cache[layer_idx] is None:
             self.key_cache[layer_idx] = key_states
@@ -131,7 +131,7 @@ class Olmo3_5HybridDynamicCache:
                     0, beam_idx.to(device)
                 )
 
-    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+    def get_seq_length(self, layer_idx: int | None = 0) -> int:
         layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
         if len(self.key_cache) <= layer_idx or self.key_cache[layer_idx] is None:
             return 0
@@ -284,9 +284,9 @@ class Olmo3_5HybridRotaryEmbedding(nn.Module):
 
     @staticmethod
     def compute_default_rope_parameters(
-        config: Optional[Olmo3_5HybridConfig] = None,
+        config: Olmo3_5HybridConfig | None = None,
         device: Optional["torch.device"] = None,
-        seq_len: Optional[int] = None,
+        seq_len: int | None = None,
     ) -> tuple["torch.Tensor", float]:
         """
         Computes the inverse frequencies according to the original RoPE implementation
@@ -335,7 +335,7 @@ def prepare_lens_from_mask(mask: torch.BoolTensor) -> torch.LongTensor:
 
 def prepare_cu_seqlens_from_lens(
     lens: torch.LongTensor,
-    dtype: Optional[torch.dtype] = torch.int32,
+    dtype: torch.dtype | None = torch.int32,
 ) -> torch.LongTensor:
     """Compute cumulative sequence lengths from lengths."""
     return F.pad(lens.cumsum(dim=0, dtype=dtype), (1, 0))
@@ -343,7 +343,7 @@ def prepare_cu_seqlens_from_lens(
 
 def prepare_cu_seqlens_from_mask(
     mask: torch.BoolTensor,
-    dtype: Optional[torch.dtype] = torch.int32,
+    dtype: torch.dtype | None = torch.int32,
 ) -> torch.LongTensor:
     """Compute cumulative sequence lengths from attention mask."""
     return prepare_cu_seqlens_from_lens(prepare_lens_from_mask(mask), dtype)
@@ -648,9 +648,9 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Optional["Olmo3_5HybridDynamicCache"] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        cache_params: Olmo3_5HybridDynamicCache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -808,7 +808,7 @@ def eager_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
     **kwargs: Unpack[TransformersKwargs],
@@ -829,7 +829,7 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -837,8 +837,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         k (`torch.Tensor`): The key tensor.
         cos (`torch.Tensor`): The cosine part of the rotary embedding.
         sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
         unsqueeze_dim (`int`, *optional*, defaults to 1):
             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
@@ -900,11 +898,11 @@ class Olmo3_5HybridAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -1178,15 +1176,15 @@ class Olmo3_5HybridForCausalLM(Olmo3_5HybridPreTrainedModel, GenerationMixin):
     @auto_docstring
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""

@@ -36,6 +36,7 @@ tokenizer = AutoTokenizer.from_pretrained("/output/path")
 
 Important note: you need to be able to host the whole model in RAM to execute this script.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -439,7 +440,9 @@ def write_model(
     max_position_embeddings = olmo_config.get("train_module", {}).get("max_sequence_length", 65536)
 
     layer_types = get_layer_types_from_config(olmo_config)
-    fla_hybrid_attention_indices = [i for i, lt in enumerate(layer_types) if lt in ("full_attention", "sliding_attention")]
+    fla_hybrid_attention_indices = [
+        i for i, lt in enumerate(layer_types) if lt in ("full_attention", "sliding_attention")
+    ]
 
     fla_layer_kwargs = fla_config.get("fla_layer_kwargs", {})
     linear_key_head_dim = fla_layer_kwargs.get("head_dim", 96)
@@ -542,7 +545,7 @@ def write_model(
 
     print("Loading the checkpoint in a Olmo 3.5 Hybrid model.")
     model = Olmo3_5HybridForCausalLM.from_pretrained(
-        tmp_model_path, 
+        tmp_model_path,
         torch_dtype=torch.bfloat16,
         use_safetensors=False,
     )
@@ -569,9 +572,7 @@ def _write_tokenizer(output_path: Path | str, tokenizer_id: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert OLMo 3.5 Hybrid weights to HuggingFace format."
-    )
+    parser = argparse.ArgumentParser(description="Convert OLMo 3.5 Hybrid weights to HuggingFace format.")
     parser.add_argument(
         "--input_dir",
         required=True,

@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 the HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,18 +24,18 @@ from transformers.testing_utils import (
     Expectations,
     cleanup,
     require_torch,
-    require_torch_gpu,
     require_torch_multi_gpu,
     slow,
     torch_device,
 )
+from transformers.utils.import_utils import is_flash_linear_attention_available
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
 from ...test_modeling_common import (
     TEST_EAGER_MATCHES_SDPA_INFERENCE_PARAMETERIZATION,
     _test_eager_matches_sdpa_inference,
 )
-from transformers.utils.import_utils import is_flash_linear_attention_available
+
 
 if is_torch_available():
     import torch
@@ -156,7 +155,8 @@ class Olmo3_5HybridModelTest(CausalLMModelTest, unittest.TestCase):
     all_model_classes = (Olmo3_5HybridModel, Olmo3_5HybridForCausalLM) if is_torch_available() else ()
     pipeline_model_mapping = (
         {"feature-extraction": Olmo3_5HybridModel, "text-generation": Olmo3_5HybridForCausalLM}
-        if is_torch_available() else {}
+        if is_torch_available()
+        else {}
     )
     test_headmasking = False
     test_pruning = False
@@ -269,7 +269,7 @@ class Olmo3_5HybridModelTest(CausalLMModelTest, unittest.TestCase):
             output_attentions,
             enable_kernels,
         )
-    
+
     @unittest.skip("The specific cache format cannot be instantiated from dp/ddp data.")
     def test_multi_gpu_data_parallel_forward(self):
         pass
@@ -314,7 +314,6 @@ class Olmo3_5HybridModelTest(CausalLMModelTest, unittest.TestCase):
     @unittest.skip("Hybrid model requires layer_types in config")
     def test_model_rope_scaling_from_config_1_dynamic(self, *args, **kwargs):
         pass
-
 
     def _skip_if_no_fla(self, reason="Fallback only supports bfloat16/float16, not float32"):
         if not is_flash_linear_attention_available():
@@ -380,13 +379,59 @@ class Olmo3_5HybridIntegrationTest(unittest.TestCase):
         atol = 1e-2 if is_flash_linear_attention_available() else 5e-2
 
         expectations = Expectations(
-            {("cuda", 8): [[-3.819033145904541, -3.795485734939575, -2.975806951522827, -2.7940011024475098, -3.548236131668091, -4.012556552886963, -4.722480773925781, -4.015453338623047]]}
+            {
+                ("cuda", 8): [
+                    [
+                        -3.819033145904541,
+                        -3.795485734939575,
+                        -2.975806951522827,
+                        -2.7940011024475098,
+                        -3.548236131668091,
+                        -4.012556552886963,
+                        -4.722480773925781,
+                        -4.015453338623047,
+                    ]
+                ]
+            }
         )
         EXPECTED_MEAN = torch.tensor(expectations.get_expectation(), device=torch_device)
         torch.testing.assert_close(out.mean(-1), EXPECTED_MEAN, rtol=rtol, atol=atol)
 
         expectations = Expectations(
-            {("cuda", 8): [3.828125, -0.546875, -1.7578125, -2.203125, -2.25, -2.890625, -0.87109375, -1.21875, -1.65625, -2.78125, -1.2890625, 0.8359375, -2.578125, 0.8125, -2.1875, 2.921875, 3.671875, 3.5625, 3.109375, 2.78125, 2.703125, 1.7578125, 1.890625, 2.21875, 1.8984375, -2.5, -2.03125, -4.03125, 1.2421875, -1.1328125]}
+            {
+                ("cuda", 8): [
+                    3.828125,
+                    -0.546875,
+                    -1.7578125,
+                    -2.203125,
+                    -2.25,
+                    -2.890625,
+                    -0.87109375,
+                    -1.21875,
+                    -1.65625,
+                    -2.78125,
+                    -1.2890625,
+                    0.8359375,
+                    -2.578125,
+                    0.8125,
+                    -2.1875,
+                    2.921875,
+                    3.671875,
+                    3.5625,
+                    3.109375,
+                    2.78125,
+                    2.703125,
+                    1.7578125,
+                    1.890625,
+                    2.21875,
+                    1.8984375,
+                    -2.5,
+                    -2.03125,
+                    -4.03125,
+                    1.2421875,
+                    -1.1328125,
+                ]
+            }
         )
         EXPECTED_SLICE = torch.tensor(expectations.get_expectation(), device=torch_device)
         torch.testing.assert_close(out[0, 0, :30], EXPECTED_SLICE, rtol=rtol, atol=atol)

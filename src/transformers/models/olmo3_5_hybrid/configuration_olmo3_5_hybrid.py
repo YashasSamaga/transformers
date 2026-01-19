@@ -18,7 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from ...configuration_utils import PreTrainedConfig, layer_type_validation
 
 
@@ -26,7 +25,8 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Olmo3_5HybridModel`]. It is used to instantiate
     an OLMo 3.5 Hybrid model according to the specified arguments, defining the model architecture. Instantiating a
-    configuration with the defaults will yield a similar configuration to that of the OLMo 3.5 Hybrid model.
+    configuration with the defaults will yield a similar configuration to that of the
+    [allenai/OLMo-3.5-1B-Hybrid](https://huggingface.co/allenai/OLMo-3.5-1B-Hybrid) model.
 
     The OLMo 3.5 Hybrid model combines standard transformer attention layers with GatedDeltaNet linear attention
     layers for improved efficiency while maintaining model quality.
@@ -86,10 +86,7 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         layer_types (`list`, *optional*):
             Attention pattern for each layer. Can contain `"full_attention"`, `"sliding_attention"`, or
             `"linear_attention"`. Defaults to linear attention for most layers with full attention for every
-            4th layer (determined by `fla_hybrid_attention_indices`).
-        fla_hybrid_attention_indices (`list[int]`, *optional*):
-            List of layer indices that should use full attention instead of linear attention. Defaults to
-            every 4th layer (i.e., layers where `i % 4 == 3`). Only used when `layer_types` is not provided.
+            4th layer.
         linear_num_key_heads (`int`, *optional*):
             Number of key heads for the linear attention layers. Defaults to `num_attention_heads`.
         linear_num_value_heads (`int`, *optional*):
@@ -158,7 +155,6 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         rms_norm_eps: float | None = 1e-06,
         sliding_window: int | None = 4096,
         layer_types: list[str] | None = None,
-        fla_hybrid_attention_indices: list[int] | None = None,
         linear_num_key_heads: int | None = None,
         linear_num_value_heads: int | None = None,
         linear_key_head_dim: int | None = None,
@@ -169,17 +165,11 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         **kwargs,
     ):
         if layer_types is None:
-            if fla_hybrid_attention_indices is None:
-                fla_hybrid_attention_indices = [i for i in range(int(num_hidden_layers)) if i % 4 == 3]
-
+            # Default: linear attention for most layers, full attention every 4th layer
             layer_types = ["linear_attention"] * int(num_hidden_layers)
-            for idx in fla_hybrid_attention_indices:
-                if idx < 0 or idx >= int(num_hidden_layers):
-                    raise ValueError(
-                        f"`fla_hybrid_attention_indices` contains an out-of-range layer index {idx} "
-                        f"for num_hidden_layers={num_hidden_layers}."
-                    )
-                layer_types[idx] = "full_attention"
+            for i in range(int(num_hidden_layers)):
+                if i % 4 == 3:
+                    layer_types[i] = "full_attention"
 
         if len(layer_types) != int(num_hidden_layers):
             raise ValueError(
@@ -207,6 +197,11 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         self.use_cache = use_cache
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.tie_word_embeddings = tie_word_embeddings
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+
         self.rms_norm_eps = rms_norm_eps
         self.sliding_window = sliding_window
 
@@ -219,16 +214,7 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
 
         self.rope_parameters = rope_parameters
 
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-        self.fla_hybrid_attention_indices = [
-            i for i, t in enumerate(self.layer_types) if t in {"full_attention", "sliding_attention"}
-        ]
+        super().__init__(**kwargs)
 
         if linear_num_key_heads is None:
             linear_num_key_heads = int(num_attention_heads)
