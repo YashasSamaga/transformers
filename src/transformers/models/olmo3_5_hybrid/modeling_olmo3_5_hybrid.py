@@ -1121,7 +1121,7 @@ class Olmo3_5HybridModel(Olmo3_5HybridPreTrainedModel):
         self.norm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = (
             Olmo3_5HybridRotaryEmbedding(config=config)
-            if getattr(config, "rope_parameters", None) is not None
+            if getattr(config, "rope_theta", None) is not None
             else None
         )
         self.embedding_norm = (
