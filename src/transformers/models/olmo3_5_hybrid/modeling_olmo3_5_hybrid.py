@@ -890,14 +890,24 @@ class Olmo3_5HybridAttention(nn.Module):
         )
         self.q_norm = Olmo3_5HybridRMSNorm(config.num_attention_heads * self.head_dim, config.rms_norm_eps)
         self.k_norm = Olmo3_5HybridRMSNorm(config.num_key_value_heads * self.head_dim, config.rms_norm_eps)
+        self.use_head_qk_norm = getattr(config, "use_head_qk_norm", False)
+        if self.use_head_qk_norm:
+            # Per-head norm: weight shape is (head_dim,), shared across heads
+            self.q_norm = Olmo3_5HybridRMSNorm(self.head_dim, config.rms_norm_eps)
+            self.k_norm = Olmo3_5HybridRMSNorm(self.head_dim, config.rms_norm_eps)
         assert config.layer_types is not None
         self.attention_type = config.layer_types[layer_idx]
         self.sliding_window = config.sliding_window if self.attention_type == "sliding_attention" else None
+        self.g_proj = (
+            nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+            if getattr(config, "use_attention_gate", False)
+            else None
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
@@ -906,16 +916,28 @@ class Olmo3_5HybridAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states))
-        key_states = self.k_norm(self.k_proj(hidden_states))
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+
+        if not self.use_head_qk_norm:
+            # Full-dim norm: apply before reshape
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
 
         query_states = query_states.view(hidden_shape).transpose(1, 2)
         key_states = key_states.view(hidden_shape).transpose(1, 2)
         value_states = value_states.view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if self.use_head_qk_norm:
+            # Per-head norm: apply after reshape (norm weight is head_dim, shared across heads)
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+
+        cos, sin = None, None
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -939,6 +961,9 @@ class Olmo3_5HybridAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        if self.g_proj is not None:
+            gate = torch.sigmoid(self.g_proj(hidden_states).float()).to(attn_output.dtype)
+            attn_output = attn_output * gate
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -969,12 +994,15 @@ class Olmo3_5HybridDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_feedforward_layernorm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.use_peri_norm = getattr(config, "use_peri_norm", False)
+        if self.use_peri_norm:
+            # Peri-norm: pre + post norms for both attention and FF
+            self.pre_attention_norm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.pre_feedforward_norm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
             self.linear_attn = Olmo3_5HybridGatedDeltaNet(config, layer_idx=layer_idx)
-            # For linear attention, we need a PRE-norm (fla_norm)
-            # The post_attention_layernorm from parent becomes the fla_norm
-            # We rename it conceptually but keep the same weight
             del self.self_attn
 
     def forward(
@@ -988,11 +1016,41 @@ class Olmo3_5HybridDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        if self.layer_type == "linear_attention":
-            # OLMo-core FLABlock: h = x + fla(fla_norm(x))
-            # post_attention_layernorm is used as fla_norm (pre-norm)
+        if self.use_peri_norm:
+            # Peri-norm: h = x + post_norm(mixer(pre_norm(x))) for all layer types
             residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)  # Norm BEFORE FLA
+            hidden_states = self.pre_attention_norm(hidden_states)
+            if self.layer_type == "linear_attention":
+                hidden_states = self.linear_attn(
+                    hidden_states=hidden_states,
+                    cache_params=past_key_values,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
+                )
+            else:
+                hidden_states, _ = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+
+            # MLP: h = h + post_ff_norm(mlp(pre_ff_norm(h)))
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_norm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        elif self.layer_type == "linear_attention":
+            # Pre-norm only (original hybrid behavior)
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
@@ -1001,14 +1059,12 @@ class Olmo3_5HybridDecoderLayer(GradientCheckpointingLayer):
             )
             hidden_states = residual + hidden_states
 
-            # MLP: h = h + mlp(mlp_norm(h))
             residual = hidden_states
-            hidden_states = self.post_feedforward_layernorm(hidden_states)  # Norm BEFORE MLP
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
         else:
-            # Standard attention layers: OLMo-core ReorderedNormTransformerBlock
-            # h = x + post_attn_norm(attn(x))
+            # Post-norm only (ReorderedNorm behavior)
             residual = hidden_states
             hidden_states, _ = self.self_attn(
                 hidden_states=hidden_states,
@@ -1020,13 +1076,12 @@ class Olmo3_5HybridDecoderLayer(GradientCheckpointingLayer):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-            hidden_states = self.post_attention_layernorm(hidden_states)  # Norm AFTER attention
+            hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = residual + hidden_states
 
-            # MLP: h = h + post_ff_norm(mlp(h))
             residual = hidden_states
             hidden_states = self.mlp(hidden_states)
-            hidden_states = self.post_feedforward_layernorm(hidden_states)  # Norm AFTER MLP
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = residual + hidden_states
 
         return hidden_states
@@ -1064,7 +1119,16 @@ class Olmo3_5HybridModel(Olmo3_5HybridPreTrainedModel):
             [Olmo3_5HybridDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Olmo3_5HybridRotaryEmbedding(config=config)
+        self.rotary_emb = (
+            Olmo3_5HybridRotaryEmbedding(config=config)
+            if getattr(config, "rope_parameters", None) is not None
+            else None
+        )
+        self.embedding_norm = (
+            Olmo3_5HybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if getattr(config, "use_embedding_norm", False)
+            else None
+        )
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -1088,6 +1152,11 @@ class Olmo3_5HybridModel(Olmo3_5HybridPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        if getattr(self.config, "embed_scale", None) is not None:
+            inputs_embeds = inputs_embeds * self.config.embed_scale
+        if self.embedding_norm is not None:
+            inputs_embeds = self.embedding_norm(inputs_embeds)
 
         if use_cache:
             if past_key_values is None or not isinstance(past_key_values, Olmo3_5HybridDynamicCache):
@@ -1117,7 +1186,7 @@ class Olmo3_5HybridModel(Olmo3_5HybridPreTrainedModel):
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids) if self.rotary_emb is not None else None
 
         for decoder_layer in self.layers:
             if decoder_layer.layer_type == "linear_attention":

@@ -162,6 +162,11 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         linear_conv_kernel_dim: int = 4,
         linear_use_gate: bool = True,
         linear_allow_neg_eigval: bool = True,
+        embed_scale: float | None = None,
+        use_embedding_norm: bool = False,
+        use_attention_gate: bool = False,
+        use_head_qk_norm: bool = False,
+        use_peri_norm: bool = False,
         **kwargs,
     ):
         if layer_types is None:
@@ -232,6 +237,11 @@ class Olmo3_5HybridConfig(PreTrainedConfig):
         self.linear_conv_kernel_dim = int(linear_conv_kernel_dim)
         self.linear_use_gate = bool(linear_use_gate)
         self.linear_allow_neg_eigval = bool(linear_allow_neg_eigval)
+        self.embed_scale = embed_scale
+        self.use_embedding_norm = use_embedding_norm
+        self.use_attention_gate = use_attention_gate
+        self.use_head_qk_norm = use_head_qk_norm
+        self.use_peri_norm = use_peri_norm
 
 
 __all__ = ["Olmo3_5HybridConfig"]
