@@ -73,6 +73,28 @@ class OlmoHybridSmallConfig(OlmoHybridConfig):
     use_head_qk_norm (`bool`, *optional*, defaults to `True`):
         Whether to use per-head QK normalization (norm of size head_dim per head) instead of
         full-dim norm (norm of size num_heads * head_dim).
+    linear_num_key_heads (`int`, *optional*):
+        Number of key heads for the linear attention layers. Defaults to `num_attention_heads`.
+    linear_num_value_heads (`int`, *optional*):
+        Number of value heads for the linear attention layers. Defaults to `num_attention_heads`.
+    linear_key_head_dim (`int`, *optional*):
+        Dimension of each key head in linear attention layers. Defaults to `head_dim`.
+    linear_value_head_dim (`int`, *optional*):
+        Dimension of each value head in linear attention layers. Defaults to `2 * linear_key_head_dim`.
+    linear_a_log_min (`float`, *optional*, defaults to 0.0):
+        Minimum value for uniform initialization of A_log in GatedDeltaNet layers.
+    linear_a_log_max (`float`, *optional*, defaults to 16.0):
+        Maximum value for uniform initialization of A_log in GatedDeltaNet layers.
+    linear_dt_min (`float`, *optional*, defaults to 0.001):
+        Minimum value for dt initialization in GatedDeltaNet layers.
+    linear_dt_max (`float`, *optional*, defaults to 0.1):
+        Maximum value for dt initialization in GatedDeltaNet layers.
+    linear_dt_init_floor (`float`, *optional*, defaults to 0.0001):
+        Floor value for clamping dt during initialization in GatedDeltaNet layers.
+    linear_conv_kernel_dim (`int`, *optional*, defaults to 4):
+        Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
+    linear_allow_neg_eigval (`bool`, *optional*, defaults to `True`):
+        Whether to allow negative eigenvalues in the GatedDeltaNet recurrence.
 
     Example:
 
