@@ -391,6 +391,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("olmo2", "Olmo2Config"),
         ("olmo3", "Olmo3Config"),
         ("olmo_hybrid", "OlmoHybridConfig"),
+        ("olmo_hybrid_small", "OlmoHybridSmallConfig"),
         ("olmoe", "OlmoeConfig"),
         ("omdet-turbo", "OmDetTurboConfig"),
         ("oneformer", "OneFormerConfig"),

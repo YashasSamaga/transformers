@@ -302,6 +302,7 @@ if TYPE_CHECKING:
     from .olmo2 import *
     from .olmo3 import *
     from .olmo_hybrid import *
+    from .olmo_hybrid_small import *
     from .olmoe import *
     from .omdet_turbo import *
     from .oneformer import *
