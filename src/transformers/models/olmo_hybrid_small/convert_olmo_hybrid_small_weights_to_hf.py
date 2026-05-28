@@ -507,7 +507,7 @@ def write_model(
 
     print(f"Total parameters: {param_count}")
 
-    # Build HF config — NoPE model, so rope_parameters must be None
+    # Build HF config — NoPE model, so rope_parameters must disable RoPE
     config = OlmoHybridSmallConfig(
         vocab_size=model_config["vocab_size"],
         hidden_size=dim,
@@ -533,7 +533,7 @@ def write_model(
     # Explicitly ensure NoPE — prevent Transformers from re-enabling RoPE
     # (see: https://github.com/huggingface/transformers/issues — rope_parameters: null
     # gets cast back to defaults in Transformers 5.7.0+)
-    config.rope_parameters = None
+    config.rope_parameters = {"rope_theta": None}
 
     config.architectures = ["OlmoHybridSmallForCausalLM"]
 
@@ -562,25 +562,27 @@ def write_model(
 
 def _patch_config_rope(model_path: str) -> None:
     """
-    Ensure rope_parameters is explicitly null in saved config.json.
+    Ensure rope_parameters explicitly disables RoPE in saved config.json.
 
     This prevents Transformers from silently re-enabling RoPE when loading
     a NoPE model. The root cause is that PreTrainedConfig.__init__ calls
     convert_rope_params_to_dict() which fills in default rope_theta=10000
     when rope_parameters is missing or null.
+
+    Fix: set rope_parameters to {"rope_theta": null} instead of null.
     """
     config_path = Path(model_path) / "config.json"
     with open(config_path, "r") as f:
         config_dict = json.load(f)
 
-    # Force NoPE: remove any auto-populated rope fields
-    config_dict["rope_parameters"] = None
+    # Force NoPE: use {"rope_theta": null} to prevent default-filling
+    config_dict["rope_parameters"] = {"rope_theta": None}
     config_dict.pop("rope_scaling", None)
     config_dict.pop("rope_theta", None)
 
     with open(config_path, "w") as f:
         json.dump(config_dict, f, indent=2)
-    print("Patched config.json: rope_parameters=null (NoPE)")
+    print("Patched config.json: rope_parameters={'rope_theta': null} (NoPE)")
 
 
 def _write_tokenizer(
